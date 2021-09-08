@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+
+# bbl_index creates an index.html file for accessing the
+# resources and data stored in a Blackboard Learn backup archive.
+# It also creates TSV files in Blackboard's assessment import
+# format.
+
+# Installation:
+#
+# pip3 install beautifulsoup4
+# pip3 install lxml
+# chmod a+x bbl_index
+# mv it somewhere in your path
+#
+# Usage:
+#
+# cd <unarchived backup directory>
+# bbl_index
+#
+# See also: http://www.imsglobal.org/content/packaging/index.html
+
+import sys
+import os
+import re
+from bs4 import BeautifulSoup
+
+
+def strip_tags(text):
+    """Remove xml/html tag looking things from a string and return
+    the result."""
+
+    return re.sub('<[^<]+?>', '', text)
+
+
+def reformat_date(date_string):
+    """Re-format the date as described in date_string.  Currently, this
+    just removes the time but you can adjust to taste."""
+
+    return date_string.split(" ")[0]
+
+
+def kind_from_contenthandler(value):
+    """.dat files may include a tag that looks like this:
+
+        <CONTENTHANDLER value="resource/x-bb-folder"/>
+
+    The contenthandler tag often (but not always) identifies the kind
+    of resource the .dat file refers to. This function uses the
+    contenthandler value to return a human readable description of
+    the resource type."""
+
+    # We don't need the first part of the resource descriptor, so we
+    # remove it.  We also remove any extraneous whitespace.
+    value = value.replace("resource/x-bb-", "").strip()
+
+    # Some of the internal names are just strange so we hard map them
+    # to the names used externally by Blackboard.
+    if value == "asmt-test-link":
+        return "Assessment"
+    elif value == "externallink":
+        return "Link"
+    elif value == "youtube-mashup":
+        return "YouTube Mashup"
+    elif value == "blankpage":
+        return "Page"
+    elif value == "document":
+        return "Item"
+
+    # We'll assume the rest of the descriptors are fine and we just
+    # need to clean them up a bit.
+    return value.replace("-", " ").title()
+
+
+def kind_from_targettype(value):
+    """.dat files may include a tag that looks like this:
+
+    <TARGETTYPE value="APPLICATION"/>
+
+    The targettype tag often (but not always) identifies the kind
+    of resource the .dat file refers to. This function uses the
+    targettype value to return a human readable description of the
+    resource type."""
+
+    # We can do just a little cleanup to the targettype values to
+    # get something nice looking but URL is the one exception. We
+    # shouldn't try to change "URL" to "Url", for example.
+    if value == "URL":
+        return value
+    return value.replace("_", " ").title()
+
+
+def get_due_date(identifier):
+    """Return the due date given in the gradebook for the assessment
+    associated with identifier."""
+
+    return reformat_date(
+        gradebook.OUTCOMEDEFINITIONS.find("CONTENTID", value=identifier).
+        parent.DATES.DUE["value"])
+
+
+def get_resource_info(identifier):
+    """Each identifier is associated with a .dat file that contains XML
+    describing the resource.  This function summarizes that information
+    in a dict."""
+
+    info = {
+        # What kind of resource is this?  Application, Link, Assessment, etc.
+        "kind": False,
+
+        # The internal or external path to the resource
+        "link": False,
+
+        # The textual description of the resource
+        "description": False,
+
+        # When the resource becomes available
+        "start": False,
+
+        # When the resource is no longer available
+        "end": False,
+
+        # When the activity is due
+        "due": False
+    }
+
+    # Load the resource as a BS object
+    resource = False
+    with open(identifier + ".dat") as fp:
+        resource = BeautifulSoup(fp, 'xml')
+
+    if not resource:
+        return info
+
+    # What kind of content is it?
+    if resource.TARGETTYPE and resource.TARGETTYPE['value']:
+        info["kind"] = kind_from_targettype(
+            resource.TARGETTYPE['value'])
+
+    elif resource.CONTENTHANDLER and resource.CONTENTHANDLER['value']:
+        info["kind"] = kind_from_contenthandler(
+            resource.CONTENTHANDLER['value'])
+
+    elif resource.ISFOLDER and resource.ISFOLDER['value'] == "true":
+        info["kind"] = "Content Folder"
+
+    else:
+        info["kind"] = "Unknown"
+        print("Warning ({}.dat): Unknown content type".format(identifier))
+
+    # Determine the path/link to the content
+    if resource.URL and resource.URL["value"]:
+        info["link"] = resource.URL["value"]
+
+    elif resource.FILES and resource.FILES.FILE:
+        _, extension = os.path.splitext(resource.FILES.FILE.LINKNAME["value"])
+        info["link"] = "./csfiles/home_dir/__" + \
+            resource.FILES.FILE.NAME.string[1:] + \
+            extension
+
+        # We don't use the original file name but I'm storing it here for
+        # possible future use.
+        info["original_name"] = resource.FILES.FILE.LINKNAME["value"]
+
+    if info["kind"] == "YouTube Mashup":
+        # Mashups are a special case since they contain another level of
+        # indirection.  We have to load the mashup string as a BS object
+        # to find the link.
+        try:
+            info["link"] = BeautifulSoup(resource.TEXT.string, 'xml').a['href']
+        except Exception:
+            pass
+
+    elif info["kind"] == "Assessment":
+        # The assessment content is in another file.  We'll convert the
+        # assessment to TSV format and link to the converted file.
+        assessment_identifier = manifest.find(
+            'resource',
+            attrs={"bb:title": resource.TITLE['value']})['identifier']
+        assessment_to_tsv(assessment_identifier)
+        info["link"] = "index_" + assessment_identifier + ".txt"
+
+    # Find the due date if it exists
+    try:
+        info["due"] = get_due_date(identifier)
+    except Exception:
+        pass
+
+    # Find the description if it exists
+    try:
+        info["description"] = resource.BODY.TEXT.string
+    except Exception:
+        pass
+
+    # Find the item availability start if it exists
+    try:
+        info["start"] = reformat_date(resource.START["value"])
+    except Exception:
+        pass
+
+    # Find the item availability end if it exists
+    try:
+        info["end"] = reformat_date(resource.END["value"])
+    except Exception:
+        pass
+
+    return info
+
+
+def pretty_print_item(item):
+    """This recursive function prints a resource item and
+    its children."""
+
+    output.write("<li>")
+
+    if item.title:
+        info = get_resource_info(item['identifierref'])
+        info["title"] = item.title.string
+
+        if info["link"]:
+            txt = "<a href='{}'>{} [{}]</a>". \
+                format(info["link"], info["title"], info["kind"])
+
+        elif info["kind"] == "Folder":
+            txt = "<span class=\"text-success\"><b>{} [{}]</b></span>". \
+                format(info["title"], info["kind"])
+
+        else:
+            txt = "{} [{}]".format(info["title"], info["kind"])
+
+        output.write(txt)
+
+        if info["start"]:
+            output.write("<p class=\"text-muted\">Available: " +
+                         info["start"] +
+                         "</p>")
+
+        if info["end"]:
+            output.write("<p class=\"text-muted\">Unavailable: " +
+                         info["end"] +
+                         "</p>")
+
+        if info["due"]:
+            output.write("<p class=\"text-muted\">Due: " +
+                         info["due"] +
+                         "</p>\n")
+
+        if info["description"]:
+            if "Mashup" in info["kind"]:
+                # Mashup descriptions are autogenerated and I prefer
+                # not to include them.
+                pass
+            else:
+                output.write("<blockquote>" +
+                             info["description"] +
+                             "</blockquote>")
+
+    if item.item:
+        # Recursively output children if they exist.
+        output.write("<ul>")
+
+        for subitem in item.find_all("item", recursive=False):
+            pretty_print_item(subitem)
+
+        output.write("</ul>")
+
+    if info["kind"] == "Application" and info["title"] == "Announcements":
+        # Recursively output announcements if they exist.
+        output.write("<ul>")
+
+        for announcement in announcements:
+            with open(announcement["bb:file"]) as fp:
+                output.write("<li>" +
+                             BeautifulSoup(fp, 'xml').TEXT.string +
+                             "</li>")
+
+        output.write("</ul>")
+
+    output.write("</li>")
+
+
+def assessment_to_tsv(identifier):
+    """Blacboard imports from a special Excel compatible TSV file but it won't
+    export to TSV.  This function adds TSV export functionality but with some
+    limitations.  The only supported question types are:
+
+    * True/False
+    * Fill in the Blank
+    * Multiple Choice
+    * Multiple Answer
+    * Ordering
+    * Essay"""
+
+    with open(identifier + ".dat") as fp:
+        assessment = BeautifulSoup(fp, 'xml')
+
+    with open("index_" + identifier + ".txt", "w") as out:
+
+        for item in assessment.find_all("item"):
+            tsv = ""
+            kind = item.bbmd_questiontype.string
+            if kind == "True/False":
+                tsv = "TF"
+            elif kind == "Fill in the Blank":
+                tsv = "FIB"
+            elif kind == "Multiple Choice":
+                tsv = "MC"
+            elif kind == "Multiple Answer":
+                tsv = "MA"
+            elif kind == "Ordering":
+                tsv = "ORD"
+            elif kind == "Essay":
+                tsv = "ESS"
+            else:
+                print("Warning ({}.dat): " +
+                      "Skipping unsupported assessment question type: {}".
+                      format(identifier, kind))
+                continue
+
+            # Extracting the question has the same form for all types
+            question = item.presentation. \
+                find("flow", attrs={"class": "QUESTION_BLOCK"}). \
+                mat_formattedtext.string
+            tsv += "\t" + strip_tags(question)
+
+            # Extracting the answer is more complicated and is slightly
+            # different for all types.  The list of possible answers and
+            # a references to the correct answers are stored seperately.
+            # We will store the references to correct answers in
+            # the correct_identifiers list.  The order of the list is
+            # relevant for some types!
+            correct_identifiers = []
+
+            if kind == "Multiple Answer" or kind == "Ordering":
+                # Multiple answer questions and ordering questions use an
+                # XML expression to check correctness.  We don't do any
+                # fancy logic so this code will only work if the correct
+                # responses are first in an AND expression.
+                for subitem in item.find("respcondition", title="correct"). \
+                        conditionvar.find("and"). \
+                        find_all("varequal", recursive=False):
+                    correct_identifiers.append(subitem.string)
+
+            elif kind == "Fill in the Blank":
+                # Fill in the blanks mess with the title attribute so it
+                # no longer contains the value "correct".  Now we have to
+                # look for things that do NOT contain "incorrect"!
+                for subitem in item.find_all("respcondition"):
+                    if subitem["title"] == "incorrect":
+                        continue
+                    for subsubitem in subitem.conditionvar. \
+                            find_all("varequal", recursive=False):
+                        correct_identifiers.append(subsubitem.string)
+
+            elif kind == "Essay":
+                # TODO: There's an "example solution" we could pull in for
+                # essay but I have honestly never used it so I'm just
+                # skipping it.
+                pass
+
+            else:
+                # Finally, we can handle Multiple Choice and True/False
+                # which each have singular answers.  Note that True/False
+                # doesn't reference a solution it just has the value True
+                # or False.
+                correct_identifiers.append(
+                    item.
+                    find("respcondition", title="correct").
+                    find("varequal").string)
+
+            # Now based on the correct_identifiers list, the type of
+            # question, and the response labels we can output the answer
+            # in the TSV
+            if kind == "Essay":
+                # Remember, there is no "solution" for essay - we might
+                # add that later.
+                tsv += "\t"
+
+            elif kind == "True/False":
+                # True/False is easy - just output what we found.  It's
+                # not really an identifier.
+                tsv += "\t" + strip_tags(correct_identifiers[0])
+
+            elif kind == "Fill in the Blank":
+                # Fill in the blank doesn't actually use an identifier
+                # either.
+                for fib_answer in correct_identifiers:
+                    tsv += "\t" + strip_tags(fib_answer)
+
+            elif kind == "Ordering":
+                # For ordering, we create a lookup table that maps identifiers
+                # to response labels.
+                lookup = {}
+                for response in item.find_all("flow_label"):
+                    lookup[response.response_label["ident"]] = response. \
+                        find("mat_formattedtext").string
+
+                # Then we iterate over correct_identifiers and do the lookup
+                for correct in correct_identifiers:
+                    tsv += "\t" + strip_tags(lookup[correct])
+
+            else:
+                # In the case of Multiple Choice or Multiple Answer, we iterate
+                # over the answers and mark each one as correct or incorrect.
+                for response in item.find_all("flow_label"):
+                    tsv += "\t" + strip_tags(
+                        response.find("mat_formattedtext").string)
+                    if response.response_label["ident"] in correct_identifiers:
+                        tsv += "\tcorrect"
+                    else:
+                        tsv += "\tincorrect"
+
+            out.write(tsv + "\n")
+
+
+# The manifest is what links together everything in the class.
+with open("imsmanifest.xml") as fp:
+    manifest = BeautifulSoup(fp, 'xml')
+
+# The only thing I use the gradebook for is finding due dates.
+# There is other class info that could be pulled from here though.
+with open(manifest.find(
+        "resource",
+        attrs={"type": "course/x-bb-gradebook"})["bb:file"]) as fp:
+    gradebook = BeautifulSoup(fp, 'xml')
+
+# Grab the course title from the manifest.
+title = manifest.find(
+    "resource",
+    attrs={"type": "course/x-bb-coursesetting"})["bb:title"]
+
+# Grab references to all the announcements from the manifest.
+announcements = manifest.find_all(
+    "resource",
+    attrs={"type": "resource/x-bb-announcement"})
+
+rubrics = manifest.find_all(
+    "resource",
+    attrs={"type": "course/x-bb-rubrics"})
+
+with open("index.html", "w") as output:
+
+    # Output the index.html header
+    output.write("""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.0/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-KyZXEAg3QhqLMpG8r+8fhAXLRk2vvoC2f3B09zVXn8CA5QIVfZOJ3BCsw2P0p/We" crossorigin="anonymous">
+    <title>{}</title>
+  </head>
+  <body>
+    <div class="col-lg-8 mx-auto p-3 py-md-5">
+    <main>
+    <h3>{}</h3>
+""".format(title, title))
+
+    # Iteratively and recursively call pretty_print_item() to
+    # print everything in the manifest.
+    output.write("<ul>\n")
+    for item in manifest.organizations.organization.children:
+        pretty_print_item(item)
+    output.write("</ul>\n")
+
+    if rubrics:
+        for rubric in rubrics:
+            rubric_file = rubric["bb:file"]
+            with open(rubric_file) as fp:
+                rubric = BeautifulSoup(fp, 'xml')
+            rubric_title = rubric.Title["value"]
+            rubric_description = rubric.Description["value"]
+            output.write("<h3>{}</h3><p>{}</p><table>".
+                         format(rubric_title, rubric_description))
+            for row in rubric.RubricRows.find_all("Row"):
+                output.write("<tr>")
+                row_title = row.Header["value"]
+                row_percentage = float(row.Percentage["value"])
+                output.write("<td>{} ({}%)</td>".
+                             format(row_title, row_percentage))
+                for column in row.RubricColumns.find_all("Column"):
+                    output.write("<td>")
+                    cell_title = column.Header["value"]
+                    cell_desc = column.CellDescription["value"]
+                    cell_percentage = float(column.Percentage["value"])
+                    output.write("<td>{} ({}%)<p>{}</p></td>".
+                                 format(cell_title,
+                                        cell_percentage,
+                                        cell_desc))
+                output.write("</tr>")
+
+    # Output the tail of the document
+    output.write("""
+    </main>
+    </div>
+  </body>
+</html>
+""")
